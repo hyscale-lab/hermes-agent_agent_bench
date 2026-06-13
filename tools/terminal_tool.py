@@ -824,6 +824,7 @@ from tools.environments.ssh import SSHEnvironment as _SSHEnvironment
 from tools.environments.docker import DockerEnvironment as _DockerEnvironment
 from tools.environments.modal import ModalEnvironment as _ModalEnvironment
 from tools.environments.managed_modal import ManagedModalEnvironment as _ManagedModalEnvironment
+from tools.environments.agent_bench import AgentBenchEnvironment as _AgentBenchEnvironment
 from tools.managed_tool_gateway import is_managed_tool_gateway_ready
 import sys
 
@@ -1059,6 +1060,13 @@ def _get_env_config() -> Dict[str, Any]:
         default_cwd = _safe_getcwd()
     elif env_type == "ssh":
         default_cwd = "~"
+    elif env_type == "agent_bench":
+        default_cwd = (
+            os.getenv("AGENT_BENCH_SANDBOX_WORKDIR")
+            or os.getenv("AGENT_BENCH_SANDBOX_WORKSPACE_DIR")
+            or os.getenv("AGENT_BENCH_SANDBOX_AGENT_WORKSPACE_DIR")
+            or "/workspace"
+        )
     else:
         default_cwd = "/root"
 
@@ -1164,7 +1172,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     
     Args:
         env_type: One of "local", "docker", "singularity", "modal",
-            "daytona", "ssh"
+            "daytona", "ssh", "agent_bench"
         image: Docker/Singularity/Modal image name (ignored for local/ssh)
         cwd: Working directory
         timeout: Default command timeout
@@ -1188,6 +1196,9 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
 
     if env_type == "local":
         return _LocalEnvironment(cwd=cwd, timeout=timeout)
+
+    elif env_type == "agent_bench":
+        return _AgentBenchEnvironment(cwd=cwd, timeout=timeout)
     
     elif env_type == "docker":
         # One-shot orphan reaper: clean up labeled containers left behind by
@@ -1300,7 +1311,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     else:
         raise ValueError(
             f"Unknown environment type: {env_type}. Use 'local', 'docker', "
-            f"'singularity', 'modal', 'daytona', or 'ssh'"
+            f"'singularity', 'modal', 'daytona', 'ssh', or 'agent_bench'"
         )
 
 
@@ -2389,6 +2400,15 @@ def check_terminal_requirements() -> bool:
         if env_type == "local":
             return True
 
+        elif env_type == "agent_bench":
+            endpoint = os.getenv("AGENT_BENCH_TOOL_BRIDGE_ENDPOINT", "").strip()
+            if not endpoint:
+                logger.error(
+                    "Agent Bench backend selected but AGENT_BENCH_TOOL_BRIDGE_ENDPOINT is not set."
+                )
+                return False
+            return True
+
         elif env_type == "docker":
             from tools.environments.docker import find_docker
             docker = find_docker()
@@ -2481,7 +2501,7 @@ def check_terminal_requirements() -> bool:
         else:
             logger.error(
                 "Unknown TERMINAL_ENV '%s'. Use one of: local, docker, singularity, "
-                "modal, daytona, ssh.",
+                "modal, daytona, ssh, agent_bench.",
                 env_type,
             )
             return False

@@ -36,6 +36,13 @@ _DEFAULT_MAX_READ_CHARS = 100_000
 _max_read_chars_cached: int | None = None
 
 
+def _is_agent_bench_mode() -> bool:
+    return (
+        os.getenv("TERMINAL_ENV", "").strip().lower() == "agent_bench"
+        or bool(os.getenv("AGENT_BENCH_TOOL_BRIDGE_ENDPOINT", "").strip())
+    )
+
+
 def _get_max_read_chars() -> int:
     """Return the configured max characters per file read.
 
@@ -750,7 +757,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 task_data["read_timestamps"] = {}
             cached_mtime = task_data.get("dedup", {}).get(dedup_key)
 
-        if cached_mtime is not None:
+        if cached_mtime is not None and not _is_agent_bench_mode():
             try:
                 current_mtime = os.path.getmtime(resolved_str)
                 if current_mtime == cached_mtime:
@@ -859,12 +866,13 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
             # 1. Dedup: skip identical re-reads of unchanged files.
             # 2. Staleness: warn on write/patch if the file changed since
             #    the agent last read it (external edit, concurrent agent, etc.).
-            try:
-                _mtime_now = os.path.getmtime(resolved_str)
-                task_data["dedup"][dedup_key] = _mtime_now
-                task_data.setdefault("read_timestamps", {})[resolved_str] = _mtime_now
-            except OSError:
-                pass  # Can't stat — skip tracking for this entry
+            if not _is_agent_bench_mode():
+                try:
+                    _mtime_now = os.path.getmtime(resolved_str)
+                    task_data["dedup"][dedup_key] = _mtime_now
+                    task_data.setdefault("read_timestamps", {})[resolved_str] = _mtime_now
+                except OSError:
+                    pass  # Can't stat — skip tracking for this entry
 
             # Bound the per-task containers so a long CLI session doesn't
             # accumulate megabytes of dict/set state.  See _cap_read_tracker_data.
@@ -877,11 +885,12 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # truncated (large file with more content than limit covered).
         # Outside the _read_tracker_lock so the registry's own locking
         # isn't nested under ours.
-        try:
-            _partial = (offset > 1) or bool(result_dict.get("truncated"))
-            file_state.record_read(task_id, resolved_str, partial=_partial)
-        except Exception:
-            logger.debug("file_state.record_read failed", exc_info=True)
+        if not _is_agent_bench_mode():
+            try:
+                _partial = (offset > 1) or bool(result_dict.get("truncated"))
+                file_state.record_read(task_id, resolved_str, partial=_partial)
+            except Exception:
+                logger.debug("file_state.record_read failed", exc_info=True)
 
         if count >= 4:
             # Hard block: stop returning content to break the loop
@@ -997,6 +1006,8 @@ def _update_read_timestamp(filepath: str, task_id: str) -> None:
     """
     # Invalidate dedup first (before acquiring lock for timestamp update).
     _invalidate_dedup_for_path(filepath, task_id)
+    if _is_agent_bench_mode():
+        return
     try:
         resolved = str(_resolve_path_for_task(filepath, task_id))
         current_mtime = os.path.getmtime(resolved)
@@ -1016,6 +1027,8 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
     the last read_file call for this task), or None if the file is fresh
     or was never read.  Does not block — the write still proceeds.
     """
+    if _is_agent_bench_mode():
+        return None
     try:
         resolved = str(_resolve_path_for_task(filepath, task_id))
     except (OSError, ValueError):
@@ -1063,6 +1076,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             "Re-read the file or reconstruct the intended file contents before writing."
         )
     try:
+        agent_bench_mode = _is_agent_bench_mode()
         # Resolve once for the registry lock + stale check.  Failures here
         # fall back to the legacy path — write proceeds, per-task staleness
         # check below still runs.
@@ -1087,11 +1101,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         with file_state.lock_path(_resolved):
             # Cross-agent staleness wins over per-task warning when both
             # fire — its message names the sibling subagent.
-            cross_warning = file_state.check_stale(task_id, _resolved)
+            cross_warning = None if agent_bench_mode else file_state.check_stale(task_id, _resolved)
             stale_warning = _check_file_staleness(path, task_id)
             # Workspace-divergence warning: relative path resolving outside the
             # terminal's cwd (the worktree-cwd bug). Lowest priority of the three.
-            cwd_warning = _path_resolution_warning(path, Path(_resolved), task_id)
+            cwd_warning = None if agent_bench_mode else _path_resolution_warning(path, Path(_resolved), task_id)
             file_ops = _get_file_ops(task_id)
             result = file_ops.write_file(_resolved, content)
             result_dict = result.to_dict()
@@ -1107,7 +1121,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # Refresh stamps after the successful write so consecutive
             # writes by this task don't trigger false staleness warnings.
             _update_read_timestamp(path, task_id)
-            if not result_dict.get("error"):
+            if not result_dict.get("error") and not agent_bench_mode:
                 file_state.note_write(task_id, _resolved)
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
@@ -1160,6 +1174,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             if cross_warning:
                 return tool_error(cross_warning)
     try:
+        agent_bench_mode = _is_agent_bench_mode()
         # Resolve paths for locking.  Ordered + deduplicated so concurrent
         # callers lock in the same order — prevents deadlock on overlapping
         # multi-file V4A patches.
@@ -1193,9 +1208,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 except Exception:
                     _r = None
                 _path_to_resolved[_p] = _r
-                _cross = file_state.check_stale(task_id, _r) if _r else None
+                _cross = None if agent_bench_mode else file_state.check_stale(task_id, _r) if _r else None
                 _sw = _cross or _check_file_staleness(_p, task_id)
-                if not _sw and _r:
+                if not _sw and _r and not agent_bench_mode:
                     # Workspace-divergence warning (worktree-cwd bug): relative
                     # path resolving outside the terminal's cwd.
                     _sw = _path_resolution_warning(_p, Path(_r), task_id)
@@ -1241,7 +1256,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 for _p in _paths_to_check:
                     _update_read_timestamp(_p, task_id)
                     _r = _path_to_resolved.get(_p)
-                    if _r:
+                    if _r and not agent_bench_mode:
                         file_state.note_write(task_id, _r)
                 # Successful patch: clear any prior consecutive-failure
                 # counters for the touched paths so a future failure on
