@@ -3,7 +3,10 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sys
+import tempfile
 import threading
+import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
@@ -73,3 +76,73 @@ class AgentBenchEnvironmentTest(unittest.TestCase):
         self.assertIn("printf hi", payload["argv"][2])
         self.assertEqual(payload["env"]["AGENT_BENCH_HERMES_SANDBOX_BACKEND"], "agent_bench")
         self.assertEqual(payload["env"]["AGENT_BENCH_HERMES_TOOL_OPERATION"], "exec")
+
+    def test_agent_bench_runner_forces_agent_bench_terminal_backend(self):
+        from hermes_cli.agent_bench_run import run_agent_bench_session
+
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured["terminal_env"] = os.environ.get("TERMINAL_ENV")
+                captured["terminal_cwd"] = os.environ.get("TERMINAL_CWD")
+                captured["session_id"] = os.environ.get("AGENT_BENCH_HERMES_SESSION_ID")
+                captured["kwargs"] = kwargs
+
+            def run_conversation(self, instruction, task_id=None):
+                captured["instruction"] = instruction
+                captured["task_id"] = task_id
+                return {"completed": True, "final_response": "ok", "messages": [], "api_calls": 1}
+
+        fake_run_agent = types.SimpleNamespace(AIAgent=FakeAgent)
+        fake_plugins = types.SimpleNamespace(discover_plugins=lambda force=False: None)
+
+        with tempfile.TemporaryDirectory() as temp:
+            args = types.SimpleNamespace(
+                instruction="do the benchmark task",
+                instruction_file=None,
+                artifacts_dir=temp,
+                toolsets=None,
+                api_key="test-key",
+                base_url="http://127.0.0.1:4000/v1",
+                provider="custom",
+                api_mode="chat_completions",
+                model="bench-model",
+                max_iterations=3,
+                session_id="session-one",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "TERMINAL_ENV": "local",
+                    "TERMINAL_CWD": "/wrong",
+                    "AGENT_BENCH_SANDBOX_WORKDIR": "/app",
+                    "AGENT_BENCH_HERMES_SESSION_ID": "old-session",
+                },
+                clear=False,
+            ), mock.patch.dict(
+                sys.modules,
+                {"run_agent": fake_run_agent, "hermes_cli.plugins": fake_plugins},
+            ):
+                rc = run_agent_bench_session(args)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["terminal_env"], "agent_bench")
+        self.assertEqual(captured["terminal_cwd"], "/app")
+        self.assertEqual(captured["session_id"], "session-one")
+        self.assertEqual(captured["instruction"], "do the benchmark task")
+        self.assertEqual(captured["task_id"], "session-one")
+
+    def test_agent_bench_runner_treats_max_iterations_as_incomplete(self):
+        from hermes_cli.agent_bench_run import _safe_result_status
+
+        status, failure_reason = _safe_result_status(
+            {
+                "completed": False,
+                "final_response": "Summary after max iterations.",
+                "turn_exit_reason": "max_iterations_reached(90/90)",
+            }
+        )
+
+        self.assertEqual(status, "incomplete")
+        self.assertEqual(failure_reason, "max_iterations_reached(90/90)")

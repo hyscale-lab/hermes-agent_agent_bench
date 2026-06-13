@@ -58,10 +58,13 @@ def _safe_result_status(result: dict[str, Any]) -> tuple[str, str | None]:
     partial = bool(result.get("partial"))
     final_response = str(result.get("final_response") or "").strip()
     completed = bool(result.get("completed"))
+    turn_exit_reason = str(result.get("turn_exit_reason") or "").strip()
     if failed:
-        return "failed", str(result.get("failure_reason") or result.get("turn_exit_reason") or "hermes reported failure")
+        return "failed", str(result.get("failure_reason") or turn_exit_reason or "hermes reported failure")
+    if turn_exit_reason.startswith("max_iterations_reached"):
+        return "incomplete", turn_exit_reason
     if interrupted or partial:
-        return "incomplete", str(result.get("turn_exit_reason") or "interrupted or partial")
+        return "incomplete", str(turn_exit_reason or "interrupted or partial")
     if final_response or completed:
         return "completed", None
     return "incomplete", "no final response"
@@ -82,9 +85,14 @@ def _write_json(path: Path, payload: object) -> None:
 def run_agent_bench_session(args: argparse.Namespace) -> int:
     os.environ.setdefault("HERMES_YOLO_MODE", "1")
     os.environ.setdefault("HERMES_ACCEPT_HOOKS", "1")
-    os.environ.setdefault("TERMINAL_ENV", "agent_bench")
-    os.environ.setdefault("TERMINAL_CWD", os.getenv("AGENT_BENCH_SANDBOX_WORKDIR", "/workspace"))
-    os.environ.setdefault("AGENT_BENCH_HERMES_SESSION_ID", args.session_id)
+    os.environ["TERMINAL_ENV"] = "agent_bench"
+    os.environ["TERMINAL_CWD"] = (
+        os.getenv("AGENT_BENCH_SANDBOX_WORKDIR")
+        or os.getenv("AGENT_BENCH_SANDBOX_WORKSPACE_DIR")
+        or os.getenv("AGENT_BENCH_SANDBOX_AGENT_WORKSPACE_DIR")
+        or "/workspace"
+    )
+    os.environ["AGENT_BENCH_HERMES_SESSION_ID"] = args.session_id
 
     instruction = _read_instruction(args).strip()
     artifacts_dir = Path(args.artifacts_dir).expanduser()
