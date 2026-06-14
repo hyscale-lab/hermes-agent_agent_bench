@@ -82,6 +82,34 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def _set_positive_env(name: str, value: int | None) -> None:
+    if value is not None:
+        os.environ[name] = str(value)
+
+
+def _request_overrides(args: argparse.Namespace) -> dict[str, object] | None:
+    if args.llm_timeout is None:
+        return None
+    return {"timeout": args.llm_timeout}
+
+
+def _apply_context_length(agent: object, args: argparse.Namespace) -> None:
+    if args.context_length is None:
+        return
+    setattr(agent, "_config_context_length", args.context_length)
+    compressor = getattr(agent, "context_compressor", None)
+    update_model = getattr(compressor, "update_model", None)
+    if callable(update_model):
+        update_model(
+            model=args.model,
+            context_length=args.context_length,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            provider=args.provider,
+            api_mode=args.api_mode,
+        )
+
+
 def run_agent_bench_session(args: argparse.Namespace) -> int:
     os.environ.setdefault("HERMES_YOLO_MODE", "1")
     os.environ.setdefault("HERMES_ACCEPT_HOOKS", "1")
@@ -93,6 +121,8 @@ def run_agent_bench_session(args: argparse.Namespace) -> int:
         or "/workspace"
     )
     os.environ["AGENT_BENCH_HERMES_SESSION_ID"] = args.session_id
+    _set_positive_env("AGENT_BENCH_TOOL_TIMEOUT_SECONDS", args.tool_timeout)
+    _set_positive_env("AGENT_BENCH_FILE_TOOL_TIMEOUT_SECONDS", args.file_tool_timeout)
 
     instruction = _read_instruction(args).strip()
     artifacts_dir = Path(args.artifacts_dir).expanduser()
@@ -128,10 +158,13 @@ def run_agent_bench_session(args: argparse.Namespace) -> int:
         session_id=args.session_id,
         session_db=_create_session_db_for_oneshot(),
         clarify_callback=_clarify_callback,
+        max_tokens=args.max_output_tokens,
+        request_overrides=_request_overrides(args),
         skip_context_files=True,
         load_soul_identity=False,
         skip_memory=True,
     )
+    _apply_context_length(agent, args)
     agent.suppress_status_output = True
     agent.stream_delta_callback = None
     agent.tool_gen_callback = None
@@ -197,6 +230,14 @@ def run_agent_bench_session(args: argparse.Namespace) -> int:
         "provider": result.get("provider") or args.provider,
         "base_url": result.get("base_url") or args.base_url,
         "turn_exit_reason": result.get("turn_exit_reason"),
+        "limits": {
+            "max_iterations": args.max_iterations,
+            "llm_timeout_seconds": args.llm_timeout,
+            "tool_timeout_seconds": args.tool_timeout,
+            "file_tool_timeout_seconds": args.file_tool_timeout,
+            "context_length": args.context_length,
+            "max_output_tokens": args.max_output_tokens,
+        },
     }
     metrics_path = artifacts_dir / "metrics.json"
     response_path = artifacts_dir / "hermes_response.json"
@@ -242,6 +283,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-mode", default="chat_completions", help="Hermes API mode.")
     parser.add_argument("--toolsets", default="terminal,file", help="Comma-separated toolsets to enable.")
     parser.add_argument("--max-iterations", type=int, default=90, help="Maximum tool-calling iterations.")
+    parser.add_argument("--llm-timeout", type=int, default=None, help="Per-request LLM timeout in seconds.")
+    parser.add_argument("--tool-timeout", type=int, default=None, help="Default Agent Bench tool timeout in seconds.")
+    parser.add_argument("--file-tool-timeout", type=int, default=None, help="Default Agent Bench file-tool timeout in seconds.")
+    parser.add_argument("--context-length", type=int, default=None, help="Model context window hint in tokens.")
+    parser.add_argument("--max-output-tokens", type=int, default=None, help="Maximum model output tokens.")
     return parser
 
 
@@ -250,6 +296,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not args.instruction_file and not args.instruction:
         parser.error("one of --instruction-file or --instruction is required")
+    for name in ("max_iterations", "llm_timeout", "tool_timeout", "file_tool_timeout", "context_length", "max_output_tokens"):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be a positive integer")
     try:
         return run_agent_bench_session(args)
     except Exception as exc:  # noqa: BLE001 - CLI boundary

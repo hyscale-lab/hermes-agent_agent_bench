@@ -59,13 +59,28 @@ def _decode_b64(value: str | None) -> bytes:
         raise AgentBenchBridgeError(f"invalid base64 in bridge response: {exc}") from exc
 
 
+def _env_positive_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _default_tool_timeout_seconds() -> float:
+    return _env_positive_float("AGENT_BENCH_TOOL_TIMEOUT_SECONDS", 120.0)
+
+
 class AgentBenchEnvironment(BaseEnvironment):
     """Hermes environment backed by Agent Bench's /v1/exec protocol."""
 
-    def __init__(self, cwd: str = "", timeout: int = 180, env: dict[str, str] | None = None):
+    def __init__(self, cwd: str = "", timeout: int | None = None, env: dict[str, str] | None = None):
         self.endpoint = _bridge_endpoint()
         self.bridge_session_id = os.getenv("AGENT_BENCH_HERMES_SESSION_ID") or uuid.uuid4().hex
-        super().__init__(cwd=cwd or _default_cwd(), timeout=timeout, env=env or {})
+        super().__init__(cwd=cwd or _default_cwd(), timeout=timeout or int(_default_tool_timeout_seconds()), env=env or {})
         self.init_session()
 
     def _run_bash(
@@ -73,12 +88,13 @@ class AgentBenchEnvironment(BaseEnvironment):
         cmd_string: str,
         *,
         login: bool = False,
-        timeout: int = 120,
+        timeout: int | float | None = None,
         stdin_data: str | None = None,
     ):
         shell = os.getenv("AGENT_BENCH_SANDBOX_BASH", "bash")
         argv = [shell, "-lc" if login else "-c", cmd_string]
-        timeout_ms = max(1, int(float(timeout) * 1000))
+        timeout_seconds = float(timeout) if timeout is not None else _default_tool_timeout_seconds()
+        timeout_ms = max(1, int(timeout_seconds * 1000))
 
         def _exec() -> tuple[str, int]:
             return self._post_exec(argv=argv, timeout_ms=timeout_ms, stdin_data=stdin_data)
